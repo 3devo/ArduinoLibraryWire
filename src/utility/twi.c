@@ -437,7 +437,19 @@ ISR(TWI_vect)
       twi_stop();
       break;
     case TW_MT_ARB_LOST: // lost bus arbitration
+      // Equals TW_MR_ARB_LOST
       twi_error = TW_MT_ARB_LOST;
+      // Modification by 3devo: We know there are no other masters on
+      // the bus, so if the TWI hardware sees a lost arbitration, that
+      // is likely the result of noise on the bus (what has been
+      // observed is noise making a slave see an extra clock pulse,
+      // making it deliver its ack one bit too early, which then looks
+      // like an arbitration error). Since the TWI hardware will then
+      // effectively lock up waiting for a stop condition that never
+      // comes, this breaks this wait by disabling the TWI hardware and
+      // letting twi_releaseBus re-enable it. This change conflicts with
+      // actually having multiple masters on the bus.
+      TWCR = 0;
       twi_releaseBus();
       break;
 
