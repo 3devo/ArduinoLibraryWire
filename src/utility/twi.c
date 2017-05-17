@@ -21,6 +21,7 @@
 
 #include <math.h>
 #include <stdlib.h>
+#include <stdio.h>
 #include <inttypes.h>
 #include <avr/io.h>
 #include <avr/interrupt.h>
@@ -58,6 +59,7 @@ static uint8_t twi_rxBuffer[TWI_BUFFER_LENGTH];
 static volatile uint8_t twi_rxBufferIndex;
 
 static volatile uint8_t twi_error;
+static uint32_t twi_timeout;
 
 /* 
  * Function twi_init
@@ -79,7 +81,7 @@ void twi_init(void)
   // initialize twi prescaler and bit rate
   cbi(TWSR, TWPS0);
   cbi(TWSR, TWPS1);
-  TWBR = ((F_CPU / TWI_FREQ) - 16) / 2;
+  twi_setFrequency(TWI_FREQ);
 
   /* twi bit rate formula from atmega128 manual pg 204
   SCL Frequency = CPU Clock Frequency / (16 + (2 * TWBR))
@@ -88,6 +90,24 @@ void twi_init(void)
 
   // enable twi module, acks, and twi interrupt
   TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA);
+}
+
+/**
+ * To be called when a timeout is detected to reset the TWI hardware.
+ */
+static uint16_t twi_handle_timeout(uint16_t line) {
+  printf("TWI timeout on line %d, TWCR 0x%x TWSR 0x%x\n", line, TWCR, TWSR);
+
+  // Reset the TWI hardware in case it is stuck and that caused the
+  // timeout. This can happen for example when noise or a misbehaving
+  // device causes a start condition or abitration error, without a
+  // matching stop condition. If this happens, the hardware will block
+  // indefinitely, waiting for this stop condition. There is no way to
+  // find out if the hardware is indeed waiting, other than that a
+  // timeout happening.
+  TWCR = 0;
+  // Re-enable TWI and reset state
+  twi_releaseBus();
 }
 
 /* 
@@ -127,6 +147,10 @@ void twi_setAddress(uint8_t address)
 void twi_setFrequency(uint32_t frequency)
 {
   TWBR = ((F_CPU / frequency) - 16) / 2;
+
+  // Calculate the timeout at around twice the time it takes to transmit
+  // a full buffer. This assumes 10 bit times per byte.
+  twi_timeout = 1E6 * TWI_BUFFER_LENGTH * 10 * 2 / frequency;
   
   /* twi bit rate formula from atmega128 manual pg 204
   SCL Frequency = CPU Clock Frequency / (16 + (2 * TWBR))
@@ -154,8 +178,10 @@ uint8_t twi_readFrom(uint8_t address, uint8_t* data, uint8_t length, uint8_t sen
   }
 
   // wait until twi is ready, become master receiver
+  uint32_t start = micros();
   while(TWI_READY != twi_state){
-    continue;
+    if (micros() - start > twi_timeout)
+      return twi_handle_timeout(__LINE__), 0;
   }
   twi_state = TWI_MRX;
   twi_sendStop = sendStop;
@@ -183,7 +209,10 @@ uint8_t twi_readFrom(uint8_t address, uint8_t* data, uint8_t length, uint8_t sen
     // up. Also, don't enable the START interrupt. There may be one pending from the 
     // repeated start that we sent ourselves, and that would really confuse things.
     twi_inRepStart = false;			// remember, we're dealing with an ASYNC ISR
+    start = micros();
     do {
+      if (micros() - start > twi_timeout)
+        return twi_handle_timeout(__LINE__), 0;
       TWDR = twi_slarw;
     } while(TWCR & _BV(TWWC));
     TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE);	// enable INTs, but not START
@@ -193,8 +222,10 @@ uint8_t twi_readFrom(uint8_t address, uint8_t* data, uint8_t length, uint8_t sen
     TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTA);
 
   // wait for read operation to complete
+  start = micros();
   while(TWI_MRX == twi_state){
-    continue;
+    if (micros() - start > twi_timeout)
+      return twi_handle_timeout(__LINE__), 0;
   }
 
   if (twi_masterBufferIndex < length)
@@ -233,8 +264,10 @@ uint8_t twi_writeTo(uint8_t address, uint8_t* data, uint8_t length, uint8_t wait
   }
 
   // wait until twi is ready, become master transmitter
+  uint32_t start = micros();
   while(TWI_READY != twi_state){
-    continue;
+    if (micros() - start > twi_timeout)
+      return twi_handle_timeout(__LINE__), 5;
   }
   twi_state = TWI_MTX;
   twi_sendStop = sendStop;
@@ -265,7 +298,10 @@ uint8_t twi_writeTo(uint8_t address, uint8_t* data, uint8_t length, uint8_t wait
     // up. Also, don't enable the START interrupt. There may be one pending from the 
     // repeated start that we sent outselves, and that would really confuse things.
     twi_inRepStart = false;			// remember, we're dealing with an ASYNC ISR
+    start = micros();
     do {
+      if (micros() - start > twi_timeout)
+        return twi_handle_timeout(__LINE__), 5;
       TWDR = twi_slarw;				
     } while(TWCR & _BV(TWWC));
     TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE);	// enable INTs, but not START
@@ -275,8 +311,10 @@ uint8_t twi_writeTo(uint8_t address, uint8_t* data, uint8_t length, uint8_t wait
     TWCR = _BV(TWINT) | _BV(TWEA) | _BV(TWEN) | _BV(TWIE) | _BV(TWSTA);	// enable INTs
 
   // wait for write operation to complete
+  start = micros();
   while(wait && (TWI_MTX == twi_state)){
-    continue;
+    if (micros() - start > twi_timeout)
+      return twi_handle_timeout(__LINE__), 5;
   }
   
   if (twi_error == 0xFF)
@@ -366,14 +404,25 @@ void twi_reply(uint8_t ack)
  * Input    none
  * Output   none
  */
-void twi_stop(void)
+void twi_stop(uint16_t line)
 {
   // send stop condition
   TWCR = _BV(TWEN) | _BV(TWIE) | _BV(TWEA) | _BV(TWINT) | _BV(TWSTO);
 
   // wait for stop condition to be exectued on bus
   // TWINT is not set after a stop condition!
-  while(TWCR & _BV(TWSTO)){
+  // Since this is called inside interrupt handlers, micros() is not
+  // reliable, so instead just count loops. A stop condition should
+  // always run directly, but apparently sometimes doesn't. Disassembly
+  // shows this loop takes 7 cycles, so calculate the loop count from
+  // that. A single I2c clock at 100Khz takes 10us, so this should be
+  // plenty to wait for a stop to happen.
+  uint8_t count = 100 /* us */ * F_CPU / 1E6 / 7;
+  while(TWCR & _BV(TWSTO)) {
+    if (--count == 0) {
+      twi_handle_timeout(line);
+      break;
+    }
     continue;
   }
 
@@ -417,7 +466,7 @@ ISR(TWI_vect)
         twi_reply(1);
       }else{
 	if (twi_sendStop)
-          twi_stop();
+          twi_stop(__LINE__);
 	else {
 	  twi_inRepStart = true;	// we're gonna send the START
 	  // don't enable the interrupt. We'll generate the start, but we 
@@ -430,11 +479,11 @@ ISR(TWI_vect)
       break;
     case TW_MT_SLA_NACK:  // address sent, nack received
       twi_error = TW_MT_SLA_NACK;
-      twi_stop();
+      twi_stop(__LINE__);
       break;
     case TW_MT_DATA_NACK: // data sent, nack received
       twi_error = TW_MT_DATA_NACK;
-      twi_stop();
+      twi_stop(__LINE__);
       break;
     case TW_MT_ARB_LOST: // lost bus arbitration
       // Equals TW_MR_ARB_LOST
@@ -469,7 +518,7 @@ ISR(TWI_vect)
       // put final byte into buffer
       twi_masterBuffer[twi_masterBufferIndex++] = TWDR;
 	if (twi_sendStop)
-          twi_stop();
+          twi_stop(__LINE__);
 	else {
 	  twi_inRepStart = true;	// we're gonna send the START
 	  // don't enable the interrupt. We'll generate the start, but we 
@@ -480,7 +529,7 @@ ISR(TWI_vect)
 	}    
 	break;
     case TW_MR_SLA_NACK: // address sent, nack received
-      twi_stop();
+      twi_stop(__LINE__);
       break;
     // TW_MR_ARB_LOST handled by TW_MT_ARB_LOST case
 
@@ -566,7 +615,7 @@ ISR(TWI_vect)
       break;
     case TW_BUS_ERROR: // bus error, illegal stop/start
       twi_error = TW_BUS_ERROR;
-      twi_stop();
+      twi_stop(__LINE__);
       break;
   }
 }

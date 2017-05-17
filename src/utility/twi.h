@@ -48,7 +48,7 @@
   void twi_attachSlaveRxEvent( void (*)(uint8_t*, int) );
   void twi_attachSlaveTxEvent( void (*)(void) );
   void twi_reply(uint8_t);
-  void twi_stop(void);
+  void twi_stop(uint16_t);
   void twi_releaseBus(void);
 
 #endif
