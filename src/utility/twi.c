@@ -151,7 +151,11 @@ void twi_setFrequency(uint32_t frequency)
   // Calculate the timeout at around twice the time it takes to transmit
   // a full buffer. This assumes 10 bit times per byte.
   twi_timeout = 1E6 * TWI_BUFFER_LENGTH * 10 * 2 / frequency;
-  
+
+  // The slave bootloader protocol specifies a maximum of 35ms
+  // stretching
+  twi_timeout += 35000;
+
   /* twi bit rate formula from atmega128 manual pg 204
   SCL Frequency = CPU Clock Frequency / (16 + (2 * TWBR))
   note: TWBR should be 10 or higher for master mode
