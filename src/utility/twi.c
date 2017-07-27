@@ -95,7 +95,7 @@ void twi_init(void)
 /**
  * To be called when a timeout is detected to reset the TWI hardware.
  */
-static uint16_t twi_handle_timeout(uint16_t line) {
+static void twi_handle_timeout(uint16_t line) {
   printf("TWI timeout on line %d, TWCR 0x%x TWSR 0x%x\n", line, TWCR, TWSR);
 
   // Reset the TWI hardware in case it is stuck and that caused the
